@@ -108,7 +108,7 @@ struct RARHeaderDataEx
 */
 
 	VarSetCapacity(RARHeaderDataEx, 10224 + A_PtrSize*3, 0)
-	Gui, UnRAR:New
+	Gui, UnRAR:New									; output window
 	Gui, Add, Edit, x5 vUnRARLog w400 r10
 	Gui, Add, Progress, vProgress w400
 	Gui, Add, Button, w75 Default gUnRARGuiClose, &OK 
@@ -117,7 +117,7 @@ struct RARHeaderDataEx
 
 	; first pass to see if need to create dir
 	NoDir := 0
-	while !HeaderResult := DllCall(UnRAR "\RARReadHeaderEx", Ptr, Handle, Ptr, &RARHeaderDataEx)
+	while !HeaderResult := DllCall(UnRAR "\RARReadHeaderEx", Ptr, Handle, Ptr, &RARHeaderDataEx)					; read file headers
 	{
 		if !(NumGet(RARHeaderDataEx, 6144, "UInt") & 32)	; if not directory
 		{
@@ -129,14 +129,15 @@ struct RARHeaderDataEx
 				break
 			}
 		}
-		if ProcessResult := DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 0, Ptr, &DestPath, "Ptr", &DestName)	; RAR_SKIP=0, RAR_TEST=1, RAR_EXTRACT=2
+		if ProcessResult := DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 0, Ptr, &DestPath, Ptr, &DestName)		; process & move to next file in archive (RAR_SKIP=0)
       			Break
 	}
 
-	DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)		; re-open RAR file ... can't find an easy way to restart
+	; second pass to extract
+	DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)						; re-open RAR file ... can't find an easy way to restart
 	Handle := DllCall(UnRAR "\RAROpenArchiveEx", Ptr, &RAROpenArchiveDataEx, Ptr)
 	VarSetCapacity(RARHeaderDataEx, 10224 + A_PtrSize*3, 0)
-	PasswordIdx := 1, TriedPasswords := "`n"
+	PasswordIdx := 1, TriedPasswords := "`n"						; initialize password attempts for current archive
 
 	while !HeaderResult := DllCall(UnRAR "\RARReadHeaderEx", Ptr, Handle, Ptr, &RARHeaderDataEx)
 	{
@@ -145,7 +146,7 @@ struct RARHeaderDataEx
 		Progress := 0, DestName := "", Flags := NumGet(RARHeaderDataEx, 6144, "UInt") 
 		if Flags & 4		; If encrypted
 		{
-			If !Passwords
+			If !Passwords	
 			{
 				FileRead, src, *P65001 Password.txt	; 1200 unicode or 65001 UTF-8
 				Passwords := StrSplit(RegExReplace(src, "[`r`n]+", "`n"), "`n")	; Initialise array, skip blank lines
@@ -157,13 +158,13 @@ struct RARHeaderDataEx
 		UnRARLog .= UnPackFileName 
 		GuiControl,, UnRARLog, %UnRARLog%
 
-		if ProcessResult := DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 2, Ptr, &DestPath, "Ptr", &DestName)	; RAR_SKIP=0, RAR_TEST=1, RAR_EXTRACT=2
+		if ProcessResult := DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 2, Ptr, &DestPath, Ptr, &DestName)	; RAR_SKIP=0, RAR_TEST=1, RAR_EXTRACT=2
     		{ 
-			if (TryPassword) && (ProcessResult=12 || ProcessResult=24)
+			if (TryPassword) && (ProcessResult=12 || ProcessResult=24)		; if unsuccessful password (crc / password error)
 			{
-				TriedPasswords .= TryPassword "`n"				; remember previously tried passwords
-				TryPassword := ""						; make password nul to ask for password
-				While (Passwords.Length() >= PasswordIdx)			; load additional passwords, starting at first password
+				TriedPasswords .= TryPassword "`n"				; save previously tried passwords to avoid duplicates
+				TryPassword := ""						; make password nul to signal that last password failed
+				While (Passwords.Length() >= PasswordIdx)			; loop through passwords in password list, starting at first password
 				{
 					If !Instr(TriedPasswords, "`n" Passwords[PasswordIdx] "`n", 1)	; skip duplicate passwords
 						break
@@ -180,10 +181,10 @@ struct RARHeaderDataEx
     		}
 
 		UnRARLog .= "`t(" UnPackSize " bytes)`n"
-		if Flags & 4									; save successful password
+		if Flags & 4									; save successful password to file & password list if user provided password
 		{
 			UnRARLog .= "Password #" PasswordIdx ": " TryPassword "`n"
-			If Passwords.Length() < PasswordIdx					; check if it's user provided password
+			If Passwords.Length() < PasswordIdx
 			{
 				FileAppend, `n%TryPassword%, Password.txt, UTF-8
 				Passwords[PasswordIdx] := TryPassword
@@ -193,7 +194,6 @@ struct RARHeaderDataEx
 	}
 	If (HeaderResult>10)
 		GuiControl,, UnRARLog, % UnRARLog "Header error #" HeaderResult ": " ERAR[HeaderResult]
-
 	DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)
 }
 
@@ -215,7 +215,7 @@ RarCallback(Msg, User, P1, P2){		; Msg UCM_CHANGEVOLUME = 0, UCM_PROCESSDATA = 1
 	} else if (Msg=2 || Msg=3){	; P1 = pointer to password buffer, P2 = size of buffer
 		IfEqual, TryPassword	; Ask for password if no password available
 		{
-			InputBox, TryPassword, Password required, Please enter password,,,,,,,,
+			InputBox, TryPassword, Password required for %UnPackFileName%, Please enter password for %UnPackFileName%,,,,,,,,
 			IfNotEqual, ErrorLevel, 0, Return, -1
 		}
 		StrPut(TryPassword, P1, P2, Msg=3 ? "utf-16" : "cp0")
