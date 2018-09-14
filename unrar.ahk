@@ -3,39 +3,31 @@
 ; UnRAR.dll/UnRAR64.dll ahk demo, reads password from UTF-8 encoded "password.txt"
 ; UnRAR dlls at https://rarlab.com/rar_add.htm
 
-Loop, Files, *.rar
-	UnRAR(A_LoopFileFullPath)
+UnRAR("English\*.rar", "English", "\del\English")
+UnRAR("Korean\*.rar", "Korean", "\del\Korean")
 return
 
-UnRar(RarFile, DestPath="")
+UnRar(FileSpec, DestPath="", Delete="")	; FileSpec can include wildcards; if not specified DestPath will be A_WorkingDir, Delete can be -1 for pure delete, 1 for recycle, other to move to folder
 {
 	global UnPackSize, UnPackFileName, UnRARLog, Progress, TryPassword
-	static	hModule
+	static	hModule, RarCallBack, Passwords, RAROpenArchiveDataEx, RARHeaderDataEx, Version
 		, UnRAR := A_ScriptDir "\UnRAR64.dll"
-		, RarCallBack, Passwords
 		, ERAR := {11:"Not enough memory", 12:"Bad data (broken header/CRC error)", 13:"Bad archive", 14:"Unknown encryption", 15:"Cannot open file", 16:"Cannot create file", 17:"Cannot close file", 18:"Cannot read file", 19:"Cannot write file", 20:"Buffer too small", 21:"Unknown error", 22:"Missing password", 23:"Reference error", 24:"Invalid password"}
-
 	If (A_PtrSize="" || A_PtrSize="4")
 		A_PtrSize := 4, Ptr := "UInt", UnRAR := A_ScriptDir "\UnRAR.dll"
-
-	If !hModule						; initialise
+	If !hModule								; initialise DLL & related
 		if hModule := DllCall("LoadLibrary", "Str", UnRAR, Ptr)
-			RarCallBack := RegisterCallBack("RarCallBack","",4)
+			VarSetCapacity(RAROpenArchiveDataEx, (A_PtrSize*5) + 132, 0)
+			, RarCallBack := RegisterCallBack("RarCallBack","",4)
+			, Numput(RarCallBack, RAROpenArchiveDataEx, A_PtrSize*3+24)
+			, VarSetCapacity(RARHeaderDataEx, 10224 + A_PtrSize*3, 0)
+			, Version := DllCall(UnRAR "\RARGetDllVersion")
 		else {
 			msgbox Cannot load %UnRAR%
 			ExitApp
 		}
-
-	If !FileExist(RarFile)
-	{
-		msgbox %RarFile% not found
-		return 15
-	}
-
 	If (DestPath="")
 		DestPath := A_WorkingDir
-
-	; msgbox % "UnRAR v" DllCall(UnRAR "\RARGetDllVersion")
 
 /*
 struct RAROpenArchiveDataEx
@@ -54,21 +46,7 @@ struct RAROpenArchiveDataEx
   unsigned int  Reserved[28];   ;44     64	Reserved for future use, must be zero
 				;152    172
 };
-*/
 
-	VarSetCapacity(RAROpenArchiveDataEx, (A_PtrSize*5) + 132, 0)
-	Numput(&RarFile, RAROpenArchiveDataEx, A_PtrSize)
-	Numput(1, RAROpenArchiveDataEx, A_PtrSize*2, "UInt")		; OpenMode
-	Numput(RarCallBack, RAROpenArchiveDataEx, A_PtrSize*3+24)
-
-	Handle := DllCall(UnRAR "\RAROpenArchiveEx", Ptr, &RAROpenArchiveDataEx, Ptr)
-	If OpenResult := NumGet(RAROpenArchiveDataEx, A_PtrSize*2+4, "UInt")
-	{
-		msgbox % OpenResult ": " ERAR[OpenResult]
-		Return OpenResult
-	}
-
-/*
 struct RARHeaderDataEx
 {				  ;32 bit	64 bit
   char         ArcName[1024];     ;0   		0
@@ -107,94 +85,135 @@ struct RARHeaderDataEx
 };                                ;10236	10248
 */
 
-	VarSetCapacity(RARHeaderDataEx, 10224 + A_PtrSize*3, 0)
-	Gui, UnRAR:New									; output window
-	Gui, Add, Edit, x5 vUnRARLog w400 r10
-	Gui, Add, Progress, vProgress w400
-	Gui, Add, Button, w75 Default gUnRARGuiClose, &OK 
-	Gui, Add, Button, w75 x+25 gUnRARGuiEscape, Cancel
-	Gui, Show,, %RarFile%
-
-	; first pass to see if need to create dir
-	NoDir := 0
-	while !HeaderResult := DllCall(UnRAR "\RARReadHeaderEx", Ptr, Handle, Ptr, &RARHeaderDataEx)					; read file headers
+	Gui, UnRAR:+LastFoundExist							; check if can re-use output window
+	IfWinNotExist
 	{
-		if !(NumGet(RARHeaderDataEx, 6144, "UInt") & 32)	; if not directory
-		{
-			If !InStr(UnPackFileName := StrGet(&RARHeaderDataEx+4096 ,"utf-16"), "\")					; count number of files without directory
-				NoDir++
-			If NoDir>1
-			{
-				DestPath := RegExReplace(DestPath, "\\$") "\" RegExReplace(RarFile, "i)part\d+\.rar|\.[^\.]+$")		; automatically create folder based on archive name
-				break
-			}
-		}
-		if ProcessResult := DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 0, Ptr, &DestPath, Ptr, &DestName)		; process & move to next file in archive (RAR_SKIP=0)
-      			Break
+		Gui, UnRAR:New
+		Gui, Add, Edit, x5 vUnRARLog w400 r10
+		Gui, Add, Progress, vProgress w400
+		Gui, Add, Button, w75 Default gUnRARGuiClose, &OK 
+		Gui, Add, Button, w75 x+25 gUnRARGuiEscape, Cancel
+		Gui, Show,, UnRAR v%Version%
 	}
 
-	; second pass to extract
-	DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)						; re-open RAR file ... can't find an easy way to restart
-	Handle := DllCall(UnRAR "\RAROpenArchiveEx", Ptr, &RAROpenArchiveDataEx, Ptr)
-	VarSetCapacity(RARHeaderDataEx, 10224 + A_PtrSize*3, 0)
-	PasswordIdx := 1, TriedPasswords := "`n"						; initialize password attempts for current archive
-
-	while !HeaderResult := DllCall(UnRAR "\RARReadHeaderEx", Ptr, Handle, Ptr, &RARHeaderDataEx)
+	OrigDest := RegExReplace(DestPath, "\\$")				; Save original destpath for automatic child folder creation (otherwise will result in chained child paths)
+	Loop, Files, %FileSpec%
 	{
-		UnPackFileName := StrGet(&RARHeaderDataEx+4096 ,"utf-16")
-		UnPackSize := NumGet(RARHeaderDataEx, 6156, "UInt")
-		Progress := 0, DestName := "", Flags := NumGet(RARHeaderDataEx, 6144, "UInt") 
-		if Flags & 4		; If encrypted
+		DestPath := OrigDest, RarFile := A_LoopFileFullPath
+		Numput(&RarFile, RAROpenArchiveDataEx, A_PtrSize)		; can't use A_LoopFileFullPath in NumPut ... why?
+		UnRARLog .= "`n" RarFile
+
+		; first pass to see if need to create dir
+		Numput(0, RAROpenArchiveDataEx, A_PtrSize*2, "UInt")		; OpenMode, 0=list, 1=test/extract, 2=read headers incl split archives
+		Handle := DllCall(UnRAR "\RAROpenArchiveEx", Ptr, &RAROpenArchiveDataEx, Ptr)
+		If OpenResult := NumGet(RAROpenArchiveDataEx, A_PtrSize*2+4, "UInt")
 		{
-			If !Passwords	
-			{
-				FileRead, src, *P65001 Password.txt	; 1200 unicode or 65001 UTF-8
-				Passwords := StrSplit(RegExReplace(src, "[`r`n]+", "`n"), "`n")	; Initialise array, skip blank lines
-			}
-			If !TryPassword								; Use Last successful password if available
-				TryPassword := Passwords[PasswordIdx]
+			GuiControl,, UnRARLog, %UnRARLog%
+			UnRARLog .= " Err#" OpenResult ": " ERAR[OpenResult]
+			Continue
 		}
 
-		UnRARLog .= UnPackFileName 
-		GuiControl,, UnRARLog, %UnRARLog%
-
-		if ProcessResult := DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 2, Ptr, &DestPath, Ptr, &DestName)	; RAR_SKIP=0, RAR_TEST=1, RAR_EXTRACT=2
-    		{ 
-			if (TryPassword) && (ProcessResult=12 || ProcessResult=24)		; if unsuccessful password (crc / password error)
-			{
-				TriedPasswords .= TryPassword "`n"				; save previously tried passwords to avoid duplicates
-				TryPassword := ""						; make password nul to signal that last password failed
-				While (Passwords.Length() >= PasswordIdx)			; loop through passwords in password list, starting at first password
-				{
-					If !Instr(TriedPasswords, "`n" Passwords[PasswordIdx] "`n", 1)	; skip duplicate passwords
-						break
-					PasswordIdx++
-				}
-				
-				DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)			; re-open RAR file ... can't find an easy way to restart
-				Handle := DllCall(UnRAR "\RAROpenArchiveEx", Ptr, &RAROpenArchiveDataEx, Ptr)
-				VarSetCapacity(RARHeaderDataEx, 10224 + A_PtrSize*3, 0)
-				continue
-			}
-			GuiControl,,UnRARLog, % UnRARLog " Error #" ProcessResult ": " ERAR[ProcessResult] "`n"
-      			Break
-    		}
-
-		UnRARLog .= "`t(" UnPackSize " bytes)`n"
-		if Flags & 4									; save successful password to file & password list if user provided password
+		NoDir := 0
+		while !HeaderResult := DllCall(UnRAR "\RARReadHeaderEx", Ptr, Handle, Ptr, &RARHeaderDataEx)		; read file headers
 		{
-			UnRARLog .= "Password #" PasswordIdx ": " TryPassword "`n"
-			If Passwords.Length() < PasswordIdx
+			if !(NumGet(RARHeaderDataEx, 6144, "UInt") & 32)						; if file (i.e. not directory)
 			{
-				FileAppend, `n%TryPassword%, Password.txt, UTF-8
-				Passwords[PasswordIdx] := TryPassword
+				If !InStr(UnPackFileName := StrGet(&RARHeaderDataEx+4096 ,"utf-16"), "\")		; count number of files without directory
+					NoDir++
+				If NoDir>1
+				{											; automatically create folder based on archive name (minus parent path & extension)
+					DestPath .= "\" RegExReplace(A_LoopFileName, "i)part\d+\.rar|\.[^\.]+$")	; "\" RegExReplace(StrReplace("`n" RarFile, "`n" RegExReplace(FileSpec, "[^\\]+$")), "i)part\d+\.rar|\.[^\.]+$")
+					break
+				}
+			}
+			if DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 0, Ptr, &DestPath, Ptr, &DestName)	; process & move to next file in archive (RAR_SKIP=0)
+      				Break
+		}
+		UnRARLog .= " ==> " DestPath
+
+		; second pass to extract
+		PasswordIdx := 1, TriedPasswords := "`n", Errors := 0				; initialize password attempts for current archive
+		DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)					; re-open RAR file
+		Numput(1, RAROpenArchiveDataEx, A_PtrSize*2, "UInt")				; OpenMode, 0=list, 1=test/extract, 2=read headers incl split archives
+		Handle := DllCall(UnRAR "\RAROpenArchiveEx", Ptr, &RAROpenArchiveDataEx, Ptr)
+
+		while !HeaderResult := DllCall(UnRAR "\RARReadHeaderEx", Ptr, Handle, Ptr, &RARHeaderDataEx)
+		{
+			UnPackFileName := StrGet(&RARHeaderDataEx+4096 ,"utf-16")
+			, UnPackSize := NumGet(RARHeaderDataEx, 6156, "UInt")
+			, Progress := 0, DestName := "", Flags := NumGet(RARHeaderDataEx, 6144, "UInt") 
+			, UnRARLog .= "`n" UnPackFileName 
+
+			if FileExist(DestPath "\" UnPackFileName)
+			{
+				FileGetSize, Size, %DestPath%\%UnPackFileName%
+				If (Size==UnPackSize)
+				{
+					DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 0, Ptr, &DestPath, Ptr, &DestName)
+					UnRARLog .= " skipped -- same size (" UnPackSize " bytes)."
+					continue
+				}
+			}
+
+			if Flags & 4		; If encrypted
+			{
+				If !Passwords	
+				{
+					FileRead, src, *P65001 Password.txt	; 1200 unicode or 65001 UTF-8
+					Passwords := StrSplit(RegExReplace(src, "[`r`n]+", "`n"), "`n")	; Initialise array, skip blank lines
+				}
+				If !TryPassword								; Use Last successful password if available
+					TryPassword := Passwords[PasswordIdx]				; TryPassword = empty string if beyond password list (callback will then prompt for user password)
+			}
+
+			GuiControl,, UnRARLog, %UnRARLog%
+
+			if ProcessResult := DllCall(UnRAR "\RARProcessFileW", Ptr, Handle, "Int", 2, Ptr, &DestPath, Ptr, &DestName)	; RAR_SKIP=0, RAR_TEST=1, RAR_EXTRACT=2
+    			{ 
+				if (TryPassword) && (ProcessResult=12 || ProcessResult=24)		; if unsuccessful password (crc / password error)
+				{
+					TriedPasswords .= TryPassword "`n"				; save previously tried passwords to avoid duplicates
+					TryPassword := ""						; make password nul to signal that last password failed
+					While (Passwords.Length() >= PasswordIdx)			; loop through passwords in password list, starting at first password
+					{
+						If !Instr(TriedPasswords, "`n" Passwords[PasswordIdx] "`n", 1)	; skip duplicate passwords
+							break
+						PasswordIdx++
+					}
+					DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)			; re-open RAR file ... can't find an easy way to restart
+					Handle := DllCall(UnRAR "\RAROpenArchiveEx", Ptr, &RAROpenArchiveDataEx, Ptr)
+					continue
+				}
+				UnRARLog .= " Err#" ProcessResult ": " ERAR[ProcessResult]
+				Errors++ 
+	      			continue
+    			}
+
+			UnRARLog .= "`t(" UnPackSize " bytes)"
+			if Flags & 4									; save successful password to file & password list if user provided password
+			{
+				UnRARLog .= "`nPassword #" PasswordIdx ": " TryPassword
+				If Passwords.Length() < PasswordIdx
+				{
+					FileAppend, `n%TryPassword%, Password.txt, UTF-8
+					Passwords[PasswordIdx] := TryPassword
+				}
 			}  
 		}
+		DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)
+		If (HeaderResult>10)
+			UnRARLog .= "`nHeader err#" HeaderResult ": " ERAR[HeaderResult]
+		Else if !Errors && Delete
+		{
+			IfEqual, Delete, -1, FileDelete, %RarFile%
+			Else IfEqual, Delete, 1, FileRecycle, %RarFile%
+			Else {
+				FileCreateDir, %Delete%
+				FileMove, %RarFile%, %Delete%
+			}
+		}
 		GuiControl,, UnRARLog, %UnRARLog%
 	}
-	If (HeaderResult>10)
-		GuiControl,, UnRARLog, % UnRARLog "Header error #" HeaderResult ": " ERAR[HeaderResult]
-	DllCall(UnRAR "\RARCloseArchive", Ptr, Handle)
 }
 
 UnRARGuiEscape:
